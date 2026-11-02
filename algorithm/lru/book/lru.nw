@@ -1,0 +1,1585 @@
+# 对 LRU 的深挖，以及缓存淘汰与准入策略
+
+本来只是想复习一下lru这道经典算法题，结果我一句“如何对它建模”，就这样被LLM带着看了这么多有趣的东西。故用文学编程的形式记录在这里，就当作游记了。
+
+---
+
+先明确一下本体：核心本体是条目（entry），cache 是条目的集合。要判断是否淘汰或者是否准入，就需要在条目上找出作为标准的属性。规定比较方向之后就有序关系（全序或者偏序）。最常见的属性就是两种：
+
+1. 由时间驱动的 recency。即任意两个条目之间“谁更近被使用”的先后关系。对应 recency 序。
+2. 由事件驱动的 frequency。这个属性就是一个简单的计数器，记录条目被访问多少次。对应 frequency 序。
+
+这里直接将 entry 建模为键值对，记作(k, v)。recency 的语义是“在 recency 序里的位置”，这要求先对 recency 序进行建模。而 frequency 就是访问计数器，记作 count(k)；所有的新条目都有初值，记作 c_0。两种建序的思路分别延伸出两大类算法，分别是 LRU（Least Recently Used） 和 LFU（Least Frequently Used）。
+
+recency 由时间驱动，是一个全序。而 frequency 不是，有相同 count 的条目会大量并列，也就是说它是一个偏序。要把它变成全序，得要在频率桶里再排一个序，比如再用recency排序。
+
+注：recency也可能是导致偏序，它是实现引入的（时钟精度不够，同一时刻撞上），而frequency的偏序是语义层面固有的。
+
+两个核心操作，分别是 update(k) 和 min()。在 LRU（recency序）中，update(k) 就是把条目 k 调到序的最前面（或者说把 k 记为“被使用”）；min() 就是取当前序的最小项（或者说取当前"最久未被使用"的条目）。在 LFU（frequency序）中，update(k) 就是 count(k) += 1；min() 也是取当前序的最小项（这里是处理过得到的全序）。其余简单操作如插入和摘除等不表。
+
+两个外部操作“查”和“写”，“查”写作get(k)，“写”写作put(k, v)。接下来来定义本体自身的约束，系统内部的以及外部操作的规则。
+
+1. 缓存有容量上限 C（正整数），即任何时刻条目数不超过 C。
+2. 同一个 key 最多对应一个条目。
+3. get(k) 且 k 已在：命中；交出对应的 v，并 update(k)。
+4. get(k) 且 k 不在：未命中；条目的属性值不变，序不变。
+5. put(k, v) 且 k 已在：更新内容，并 update(k)。
+6. put(k, v) 且 k 不在、未满：插入新条目并 update(k)。
+7. put(k, v) 且 k 不在、已满：淘汰min()，插入新条目并 update(k)。
+8. 被淘汰的条目从此不存在。
+9. 除 get 与 put 外没有别的改变来源。
+
+对于 LFU 而言，插入新条目并 update(k) 的 update，实际上就是 c_0+1。这个初始值的选择有讲究。
+
+# LRU
+
+recency 序的模型有若干类。常见的有序列模型：L = [k₁,…,kₙ]，即用序列的位置来表示 recency 序，首位recency 最大。update(k) 就相当于把 k_i 摘出来插到第一位，也就是挪到 L[1]；min() 就相当于取序列的最后一位。这两个操作的时间复杂度都是 O(1)。还有一种是时间戳模型：update(k) 就是给条目打一个时间戳，时间复杂度 O(1)；min() 就是扫一遍全表，取时间戳最小的那个，时间复杂度 O(n)。这个扫一遍全表的操作在时间复杂度上比较糟糕，围绕这个有一些优化思路，比如减少比较信息，压缩属性变量等方向。
+
+## 序列模型
+
+分析一下序列模型中的两个核心动作：首先是 update(k)，它实际上是三个动作：找到 k 在哪儿，把它从当前位置摘下来，把它放到最前面。min() 取尾也要知道尾部在哪里。如何知道 k 在哪儿？可以用哈希表做一个索引：key -> entry，这样查找操作的时间复杂度就是 O(1)；如何实现任意的摘除和插入？单链表只知后继不知前驱。要摘 k，得先从头扫到 k 的前一个，O(n)。双向链表，节点自带 prev，摘除就是三行赋值，O(1)。因此最后的方案就是哈希表+双向链表。
+
+!! sequence::
+<< definition >>= @
+	using Entry = std::pair<K, V>; // 条目定义为键值对
+	using List  = std::list<Entry>; // 条目是双向链表的节点
+	List order_; // 条目序列
+	using Iter  = typename List::iterator; // 节点句柄
+	std::unordered_map<K, Iter> index_; // key -> 节点句柄的哈希映射
+	std::size_t cap_; // 缓存容量
+~@
+
+注意 std::list 是双向链表。splice 是 std::list 的成员函数，表示“剪接”：把节点从原来的位置取下来，接到指定位置。在这里就是把 it 指向的那个节点从原位置解下来，接到链表最前面。
+
+<< update >>= @
+	void update(Iter it) { order_.splice(order_.begin(), order_, it); }
+~@
+
+容量为零的缓存不成立。
+
+<< constructor >>= @
+	explicit Cache(std::size_t cap) : cap_(cap) {
+		if (cap == 0) throw std::invalid_argument("capacity must be >= 1");
+	}
+~@
+
+std::optional<V> 是 C++17 的“可能没有值”容器。get(k) 有两种结果：交出 v 和报告“没有”，如何把这两种情况区分开来？假设把返回值改成 V，用特殊值表示未命中——-1、空字符串、V{}——那么“未命中”和“命中了一个恰好等于 -1 的条目”就无法区分，值域被占用了。optional 把“有没有”和“是多少”分成两层：外层是一个 bool，内层才是 V。两者共用一块空间，但语义独立。
+
+<< get >>= @
+	std::optional<V> get(const K& k) {
+		auto p = index_.find(k);
+		if (p == index_.end()) return std::nullopt;
+		update(p->second);
+		return p->second->second;
+	}
+~@
+
+std::move 把左值转成右值。在 unordered_map 中查询使用的是 find 而不是 operator[]（operator[] 在 key 不存在时会插入一个默认构造的 value）。这里的 C++ STL 浓度有一点点高...
+
+<< put >>= @
+	void put(const K& k, V v) {
+		auto p = index_.find(k); // 在哈希表里找（_index 是哈希表）
+		if (p != index_.end()) { // 如果找到了
+			p->second->second = std::move(v); // 把那个条目的值换掉
+			update(p->second); // 更新条目
+			return;
+		}
+		if (order_.size() == cap_) { // 如果缓存满了
+			index_.erase(order_.back().first); // 把尾节点的引用从哈希表里删掉
+			order_.pop_back(); // 删掉尾节点
+		}
+		order_.emplace_front(k, std::move(v)); // 在头节点就地构造一个新节点，返回 void
+		index_.emplace(order_.front().first, order_.begin()); // 向哈希表插入一项
+	}
+~@
+
+<< size >>= @
+	std::size_t size() const     { return order_.size(); }
+~@
+
+<< capacity >>= @
+	std::size_t capacity() const { return cap_; }
+~@
+
+拼在一起：
+
+<< 序列模型 >>= @
+	#pragma once
+
+	#include <cstddef>
+	#include <list>
+	#include <optional>
+	#include <stdexcept>
+	#include <unordered_map>
+	#include <utility>
+
+	namespace seq {
+
+	template <class K, class V>
+	class Cache {
+		<< definition >> | << update >>
+	public:
+		<< constructor >>
+		<< get >> | << put >> | << size >> | << capacity >>
+	};
+
+	} // namespace seq
+~@
+
+file<hpp> lru_sequence += << 序列模型 >>;
+~::
+---
+
+## 时间戳模型
+
+时间戳模型只存时刻。`std::uint64_t` 是 64 位的无符号整数。
+
+!! timestamp::
+<< definition >>= @
+	struct Slot { // 这里内容和时间戳被捆在一起
+		V value;
+		std::uint64_t recency; // 最后一次被使用的时刻
+	};
+
+	std::size_t cap_;                   // 缓存容量
+	std::unordered_map<K, Slot> table_; // key -> 条目
+	std::uint64_t tick_ = 0;            // 全局时钟
+~@
+
+`evict_min()` 就是 min()：遍历全表删掉 recency 最小的条目。
+
+<< drop >>= @
+	void evict_min() {
+		auto victim = table_.begin();
+		for (auto it = table_.begin(); it != table_.end(); ++it)
+			if (it->second.recency < victim->second.recency) victim = it; // 找到 recency 最小的那位
+		table_.erase(victim); // 删除条目
+	}
+~@
+
+一样的，容量为零的缓存不成立。
+
+<< constructor >>= @
+	explicit Cache(std::size_t cap) : cap_(cap) {
+		if (cap == 0) throw std::invalid_argument("capacity must be >= 1");
+	}
+~@
+
+命中就把时钟往前拨一格，记在自己头上。没有节点搬迁，也没有谁的位置被牵连。未命中时连时钟都不碰——规则 4 在这里就是"这一行不执行"。
+
+<< get >>= @
+	std::optional<V> get(const K& k) {
+		auto p = table_.find(k);
+		if (p == table_.end()) return std::nullopt; // 如果没找到，就不动 tick_
+		p->second.recency = ++tick_;                // 规则 3
+		return p->second.value;
+	}
+~@
+
+`stamp` 在淘汰之前就取好了：时钟只由"使用"驱动，淘汰不是使用。
+
+`emplace` 是就地构造，不像 `operator[]` 那样先默认构造再赋值——`Slot` 里装着 `V`，若 `V` 不可默认构造，`operator[]` 这条写法根本用不了。
+
+<< put >>= @
+	void put(const K& k, V v) {                     
+		auto p = table_.find(k);                    // 在哈希表里找
+		if (p != table_.end()) {                    // 如果没找到
+			p->second.value = std::move(v);         // 换内容，走移动赋值
+			p->second.recency = ++tick_;            // 重记时刻，即 update(k)
+			return;                                 // 条目数不变，不淘汰
+		}
+		std::uint64_t stamp = ++tick_;              // 先取时刻，再淘汰
+		if (table_.size() == cap_) evict_min();     // 规则 7
+		table_.emplace(k, Slot{std::move(v), stamp}); // 规则 6
+	}
+~@
+
+两个只读接口，与序列模型一致。
+
+<< size >>= @
+	std::size_t size() const { return table_.size(); }
+~@
+
+<< capacity >>= @
+	std::size_t capacity() const { return cap_; }
+~@
+
+拼起来。注意成员与接口的分界线和序列模型是同一条：
+
+<< 时间戳模型 >>= @
+	#pragma once
+
+	#include <cstddef>
+	#include <cstdint>
+	#include <optional>
+	#include <stdexcept>
+	#include <unordered_map>
+	#include <utility>
+
+	namespace ts {
+
+	template <class K, class V>
+	class Cache {
+		<< definition >> | << drop >>
+	public:
+		<< constructor >>
+		<< get >> | << put >> | << size >> | << capacity >>
+	};
+
+	} // namespace ts
+~@
+
+file<hpp> lru_timestamp += << 时间戳模型 >>;
+~::
+
+---
+
+## CLOCK 变体
+
+上面留了一个很明显的问题，时间戳模型的 min() 为了找最小把全表遍历一遍，时间复杂度是 O(n)。这个设计不太好，有几个容易想到的优化方向，比如减少参加比较的条目，可以对条目进行分层或者采样，也就是 Redis 的做法。
+
+还有一种取巧的做法是把条目携带的信息从时间戳换成一个简单的布尔变量，记录上次指针扫过之后的使用情况。所有的条目排成一个环，一个指针在环上单向环绕，“序关系”就由这个单向移动的指针提供。规则很简单，只有两条：
+
+1. 如果访问命中，条目状态被置1；如果访问未命中，条目状态和指针都不动。
+2. 指针走到这个条目的时候，若条目状态是1，则置0；若条目状态是0，则淘汰。
+
+换句话说，淘汰的是指针转了两圈都没被访问过的。这就是 CLOCK 的做法。规则上它比lru简单得多，因为它把“序”的概念删掉了。
+
+`std::vector<std::optional<Slot>>` 是环的实现。vector 长度固定，正好对应"格子数就是容量"；optional 负责当前每格有没有条目，举个例子，初始构造的时候不需要填入一个默认构造，而是真正的空构造。
+
+!! CLOCK::
+<< 定义 >>= @
+	struct Slot {
+		K key;
+		V value;
+		bool ref = true; // 引用位：本轮还有没有第二次机会
+	};
+
+	std::size_t cap_;                          // 环上的格子数
+	std::size_t size_ = 0;                     // 已占格数
+	std::size_t hand_ = 0;                     // 指针：下一次从这里开始看
+	std::vector<std::optional<Slot>> ring_;    // 环，空位用 nullopt
+	std::unordered_map<K, std::size_t> index_; // key -> 格子下标
+~@
+
+`index_` 存的是**下标**，不是迭代器。环上的格子永不移动，下标一直有效——这与序列模型存迭代器是同一类保证，代价却不同：那边靠 list 的节点稳定性，这边靠 vector 的"只改内容、不改长度"。
+
+淘汰只做一件事：走，看位，要么清位、要么删格。
+
+<< 淘汰 >>= @
+	void evict_one() {
+		for (;;) {
+			auto& s = *ring_[hand_];
+			if (!s.ref) {                  // 第二次机会用完了
+				index_.erase(s.key);       // 规则 8
+				ring_[hand_].reset();      // 清空该格
+				--size_;
+				return;
+			}
+			s.ref = false;                 // 第一圈：先记一笔，再往前走
+			hand_ = (hand_ + 1) % cap_;
+		}
+	}
+~@
+
+那个循环不会无限转：`cap_` 至少是 1，转满一圈后所有位都成了 0，下一圈必然遇到 0。
+
+`auto& s = *ring_[hand_]` 是个隐患：`s` 引用的是 optional 里面的对象，`reset()` 之后它就悬垂了。所以 `s.key` 必须在 reset 之前取出来——顺序在这里是硬的，和序列模型里"先读 `back().first` 再 `pop_back()`"是同一类坑。
+
+未满时插哪？从 `hand_` 开始找第一个空格。这条路径和淘汰共用一根指针，省掉一张空闲表。
+
+<< 空位 >>= @
+	std::size_t claim_slot() {
+		while (ring_[hand_].has_value()) hand_ = (hand_ + 1) % cap_;
+		return hand_;
+	}
+~@
+
+上半截讲完：环、位、指针。下半截是四个外部可见的动作。
+
+<< 构造 >>= @
+	explicit Cache(std::size_t cap) : cap_(cap), ring_(cap) {
+		if (cap == 0) throw std::invalid_argument("capacity must be >= 1");
+	}
+~@
+
+`get` 是 CLOCK 里唯一"只写一个布尔"的操作。没有搬迁，没有计数，也不碰 `hand_`。
+
+<< get >>= @
+	std::optional<V> get(const K& k) {
+		auto p = index_.find(k);
+		if (p == index_.end()) return std::nullopt; // 规则 4：位和指针都不动
+		auto& s = *ring_[p->second];
+		s.ref = true;                               // 规则 3
+		return s.value;
+	}
+~@
+
+`put` 是三条路径的合流：命中就改值，未满就填空格，满了就先淘汰一格再填。注意 `hand_` 在填完之后前进一格，让下一轮的起点落在新条目之后。
+
+<< put >>= @
+	void put(const K& k, V v) {
+		auto p = index_.find(k);
+		if (p != index_.end()) {            // 规则 5
+			auto& s = *ring_[p->second];
+			s.value = std::move(v);
+			s.ref = true;
+			return;
+		}
+		if (size_ == cap_) evict_one();     // 规则 7
+		std::size_t i = claim_slot();       // 规则 6
+		ring_[i] = Slot{k, std::move(v), true};
+		index_.emplace(k, i);
+		++size_;
+		hand_ = (i + 1) % cap_;
+	}
+~@
+
+两个只读接口，与前两个模型一致。
+
+<< size >>= @
+	std::size_t size() const { return size_; }
+~@
+
+<< capacity >>= @
+	std::size_t capacity() const { return cap_; }
+~@
+
+拼装。成员与接口的分界线还是那一条：
+
+<< CLOCK模型 >>= @
+	#pragma once
+
+	#include <cstddef>
+	#include <optional>
+	#include <stdexcept>
+	#include <unordered_map>
+	#include <utility>
+	#include <vector>
+
+	namespace clk {
+
+	template <class K, class V>
+	class Cache {
+		<< 定义 >> | << 淘汰 >> | << 空位 >>
+	public:
+		<< 构造 >>
+		<< get >> | << put >> | << size >> | << capacity >>
+	};
+
+	} // namespace clk
+~@
+
+file<hpp> lru_clock += << CLOCK模型 >>;
+~::
+
+一件要说清楚的事：CLOCK 没有破坏任何一条外部规则。条目数不超容量、同 key 唯一、未命中不留痕、满时必定淘汰一个——都还在。
+
+变的是**淘汰谁**。规则 7 只说"摘除 min()"，而 min() 在这里被一个近似者顶替了：`hand_` 遇到的那个 `ref == 0` 的格子，未必是最久未用的那个。所以 CLOCK 是这本书里第一个"外部行为可观察地不一致"的模型——同一串操作喂给它和序列模型，条目集合可能就不同了。
+
+把这件事跑一遍，比讲十句清楚。容量 3，依次 `put 1`、`put 2`、`put 3`、`get(1)`、`put(4)`：
+
+```
+seq   1:Y 2:. 3:Y 4:Y     // LRU：淘汰 2
+clk   1:. 2:Y 3:Y 4:Y     // CLOCK：淘汰 1，它刚被用过
+```
+
+三格的引用位都是 1。第一圈 `hand_` 只把位清成 0，谁也不淘汰；转到起点，那格的位已经是 0 了，于是淘汰它——而它就是 1。刚 `get` 过的条目没能幸免。
+
+这是引用位只有一位的必然代价：它记不住"多久以前"，只记得"上次扫描之后有没有被用过"。一圈里所有条目都在这一轮被用过时，它就退化成"淘汰指针最先看到的那格"。
+
+同样是这台机器底下的 `min()`，序列模型答的是"谁最旧"，CLOCK 答的是"谁这一轮没被捞到"。前者可以逐条对拍，后者只能对拍界——条目数、命中过的 key 必须还在、淘汰后 `index_` 与 `ring_` 一致。
+
+这也是为什么它站在精确与近似之间：前两个模型之间可以写"结果必须逐条相等"的断言，从它开始只能写"结果必须落在某个范围里"。
+
+---
+
+## Redis 变体
+
+Redis 的淘汰是这条线上的第二种落地。它的血统是时间戳模型——每个对象带一个 24 位的 `lru` 字段，全局一个秒级时钟，命中时把时钟记到自己头上。听起来就是把上面那节原样搬过去，但有两处改动，各断一个前提。
+
+**时钟被截断了。** 24 位、精度 1 秒，约 194 天回绕。所以 idle 不能直接相减，得按无符号环形差算：`(now - lru) & 0xFFFFFF`。同一秒内被访问的两个 key 分不出先后，天然并列。精确的时间戳模型要求时钟位宽无界、永不回绕，截断之后它就不再是那个模型了。
+
+**淘汰不做全局取最小。** 这条更要紧。装满了不扫全表，而是随机抓几个 key，比出其中 idle 最大的淘汰。默认 `maxmemory-samples` 是 5。所以它保证的从来不是"淘汰最久未用的"，而是"淘汰抓到的这几个里最久未用的"。
+
+这就是它和 CLOCK 真正的关系：**两者都在回答"全局取最小太贵，改成局部取"**。CLOCK 的局部是顺着指针扫，Redis 的局部是随机抽样。抽样的名字叫近似，扫环的名字也叫近似，精度的来源不一样。
+
+!! redis::
+
+<< 定义 >>= @
+	static constexpr std::uint32_t MASK = 0xFFFFFFu; // 24 位时钟，约 194 天回绕
+	static constexpr std::size_t POOL = 16;         // 候选池：跨调用累积
+
+	struct Entry {
+		V value;
+		std::uint32_t lru; // 最后一次使用时的时钟读数
+	};
+
+	struct Pick {
+		K key;
+		std::uint32_t idle;
+	};
+
+	std::size_t cap_;
+	std::uint32_t now_ = 0;      // 秒级时钟，由 tick() 推进
+	std::size_t samples_ = 5;    // 每次抓几个
+	std::unordered_map<K, Entry> table_;
+	std::array<Pick, POOL> pool_{}; // 按 idle 升序；尾部就是当前最该走的
+	std::size_t pool_n_ = 0;
+	std::mt19937 rng_{1};
+~@
+
+时钟是显式推进的，`tick()` 一下走一秒。真实实现挂在系统时间上，这里挂在一个方法上——否则测不出"同一秒内并列"这件事。
+
+<< 时钟 >>= @
+	std::uint32_t idle_of(const Entry& e) const {
+		return (now_ - e.lru) & MASK; // 环形差：回绕过也不会算成负数
+	}
+
+~@
+
+<< 走时 >>= @
+	void tick() { now_ = (now_ + 1) & MASK; }
+~@
+
+候选池是这一节的第二个要点，也是它比"就抽 5 个"准得多的原因。Redis 3.0 起，池子活着跨过多次淘汰：每次只往池里添新抓到的样本，淘汰时从池尾取走一个，其余留着。于是实际参与比较的候选**远多于一次采样的 5 个**——它是一条滚动的、越滚越准的候选带。
+
+<< 候选 >>= @
+	void offer(const K& key, std::uint32_t idle) {
+		std::size_t i = 0;
+		while (i < pool_n_ && pool_[i].idle < idle) ++i;
+		if (i == pool_n_ && pool_n_ == POOL) return; // 比池里所有都新：不收
+		if (pool_n_ < POOL) ++pool_n_;
+		for (std::size_t j = pool_n_ - 1; j > i; --j) pool_[j] = pool_[j - 1];
+		pool_[i] = Pick{key, idle};
+	}
+
+	void evict_one() {
+		std::size_t n = table_.size();
+		auto it = table_.begin();
+		std::advance(it, rng_() % n);        // 随机起点
+		std::size_t stride = n / samples_ ? n / samples_ : 1;
+		for (std::size_t i = 0; i < samples_ && n > 0; ++i) {
+			offer(it->first, idle_of(it->second));
+			for (std::size_t s = 0; s < stride; ++s) {
+				if (++it == table_.end()) it = table_.begin();
+			}
+		}
+		const K victim = pool_[pool_n_ - 1].key; // 池尾：idle 最大
+		--pool_n_;                               // 其余的留在池里，下一轮接着用
+		table_.erase(victim);
+	}
+~@
+
+这里的"随机采样"是模拟出来的：`unordered_map` 不给桶数组，只能随机起点、定步长地走。真按 Redis 的做法，字典要自己暴露桶，直接在桶上随机跳——那样一次淘汰是严格的 O(采样数)。这一段写成迭代器步进，最坏是 O(n)，够讲清机制，不够上生产。
+
+`pool_` 里存的是 key 的**值拷贝**，不是引用。Redis 存 `sds` 指针，因为它的对象有独立生命周期；这里容器随时可能重排，存指针会悬垂。
+
+<< 构造 >>= @
+	explicit Cache(std::size_t cap, std::uint32_t seed = 1) : cap_(cap), rng_(seed) {
+		if (cap == 0) throw std::invalid_argument("capacity must be >= 1");
+	}
+~@
+
+`get` 只做一件事：把当前时钟盖上去。
+
+<< get >>= @
+	std::optional<V> get(const K& k) {
+		auto p = table_.find(k);
+		if (p == table_.end()) return std::nullopt; // 规则 4：时钟不动
+		p->second.lru = now_;                       // 规则 3
+		return p->second.value;
+	}
+~@
+
+`put` 和前两个模型同形，只有淘汰那一步换了人。
+
+<< put >>= @
+	void put(const K& k, V v) {
+		auto p = table_.find(k);
+		if (p != table_.end()) {            // 规则 5
+			p->second.value = std::move(v);
+			p->second.lru = now_;
+			return;
+		}
+		if (table_.size() == cap_) evict_one(); // 规则 7
+		table_.emplace(k, Entry{std::move(v), now_}); // 规则 6
+	}
+~@
+
+<< size >>= @
+	std::size_t size() const { return table_.size(); }
+~@
+
+<< capacity >>= @
+	std::size_t capacity() const { return cap_; }
+~@
+
+拼装：
+
+<< 模型 >>= @
+	#pragma once
+
+	#include <array>
+	#include <cstddef>
+	#include <cstdint>
+	#include <optional>
+	#include <random>
+	#include <stdexcept>
+	#include <unordered_map>
+	#include <utility>
+
+	namespace rds {
+
+	template <class K, class V>
+	class Cache {
+		<< 定义 >> | << 时钟 >> | << 候选 >>
+	public:
+		<< 走时 >>
+		<< 构造 >>
+		<< get >> | << put >> | << size >> | << capacity >>
+	};
+
+	} // namespace rds
+~@
+
+file<hpp> lru_redis += << 模型 >>;
+~::
+
+Redis 守住了全部外部规则，条目数、唯一性、未命中不留痕都在。它变的是规则 7 里的那个 `min()`——和 CLOCK 一样被顶替了，只是顶替的方式不同。
+
+把同一串操作跑一遍。容量 3，`put 1`、`put 2`、`put 3`，`tick()` 一次，`get(1)`，再 `tick()` 一次，`put(4)`：
+
+```
+seq   1:Y 2:. 3:Y 4:Y     // LRU：淘汰 2
+clk   1:. 2:Y 3:Y 4:Y     // CLOCK：淘汰 1，它刚被用过
+rds   1:Y 2:. 3:. 4:Y     // Redis：淘汰 2 或 3，取决于先抓到谁
+```
+
+三个 key 的 idle 是 1、2、2。`1` 因为刚 `get` 过，idle 最小，它一定活下来——这里 Redis 比 CLOCK 强：一位引用位记不住的事，24 位时间戳记得住。但 `2` 和 `3` 的 idle 都是 2，它们在同一个钟点被插入，秒级的表盘分不出先后。淘汰谁全看采样先碰到哪一个。
+
+这不是错，是截断的必然代价。CLOCK 错得确定——同样的输入永远同样的输出；Redis 错得随机——**结果不是错的，是不确定的**。
+
+所以对它的验收不能是"淘汰了谁"，甚至不能是"必然淘汰最久的"，只能是一条概率性质的界：池子够大、采样足够多次之后，idle 最大的那个被淘汰的比例应当远高于随机。CLOCK 至少还是确定的——同样的输入永远同样的输出，错得稳定。Redis 连这点确定性都放弃了，换来的是每次淘汰只要 O(1) 的时间。
+
+# LFU
+
+前面四个模型，换的全是 recency 怎么存：一条链、一个时间戳、一位引用位、24 位截断时钟。属性一次也没动过。LFU 把属性换了，于是要存的东西也跟着换了——问题不再是“时刻怎么存得省”，而是“计数怎么存，还能让 min() 保持 O(1)”。
+
+它换的只有两条规则。规则 3、5 里的 update(k) 从“挪到序首”变成 `count(k) += 1`；规则 7 里的 min() 从“取序尾”变成“取 count 最小的”。剩下七条一个字不动。所以 LFU 的外部行为和序列模型一样，是可以逐条对拍的——不像 CLOCK 和 Redis，只能靠界。
+
+## 频率桶
+
+计数本身没有难度，难度在 min()。给每个条目挂一个 64 位计数，取最小就得扫全表，又回到时间戳模型的老路。所以要一张 `freq → 双向链表` 的桶表：同一档频次的条目串在一条链上，链头是最近被用过的，链尾是最久没被用过的。再记一个 `minfreq_`，指向当前最低的那一档。
+
+于是两个核心操作都成了 O(1)：
+
+- update：把条目从 freq 桶摘下来，挂到 freq+1 桶的链头；
+- min：取 `minfreq_` 桶的链尾。
+
+桶内按 recency 排，作用就在这儿——它把 frequency 的大量并列消解掉了。开头说“要把它变成全序，得在频率桶里再排一个序”，兑现的就是 `splice` 到链头这一步：同频的条目之间，新旧由链上位置分。
+
+!! lfu::
+<< 定义 >>= @
+	struct Node {
+		K key;
+		V value;
+		std::uint64_t freq = 1;
+	};
+
+	using Bucket = std::list<Node>;
+	using Iter   = typename Bucket::iterator;
+
+	std::size_t cap_;
+	std::size_t size_ = 0;
+	std::uint64_t minfreq_ = 1;                         // 当前最低频次；空表时无意义
+	std::unordered_map<std::uint64_t, Bucket> buckets_; // freq -> 桶，头新尾旧
+	std::unordered_map<K, Iter> index_;                 // key -> 桶内位置
+~@
+
+`index_` 存的是 list 的迭代器，而且它必须能跨桶活着。这靠的是 `splice` 的保证：节点在链表之间搬家时，指向它的迭代器仍然有效，只是改属新链。所以 `touch` 搬完节点，`index_` 里那条记录不用改，`get` 拿到的值也还在原地。
+
+
+<< 更新 >>= @
+	void touch(Iter it) {
+		const std::uint64_t f = it->freq;
+		Bucket& from = buckets_[f];
+		Bucket& to   = buckets_[f + 1];  // 没有就现建一个空桶
+		to.splice(to.begin(), from, it); // 搬到高一档的链头
+		it->freq = f + 1;
+		if (from.empty()) {
+			buckets_.erase(f);           // 空桶要删，否则桶表随频次无限变长
+			if (minfreq_ == f) ++minfreq_; // 最低档空了，抬一格
+		}
+	}
+~@
+
+`from` 是个引用，`buckets_.erase(f)` 之后它就悬垂了。所以对它的读取必须在 erase 之前完成——这和 CLOCK 里“先取 `s.key` 再 `reset()`”是同一类顺序问题。
+
+淘汰只做三件事：找到桶尾、摘掉、删空桶。
+
+<< 淘汰 >>= @
+	void evict_one() {
+		Bucket& b = buckets_[minfreq_];
+		Iter victim = std::prev(b.end()); // 桶尾：同频里最久没用的
+		index_.erase(victim->key);        // 规则 8
+		b.erase(victim);
+		if (b.empty()) buckets_.erase(minfreq_);
+		--size_;
+	}
+~@
+
+注意这里删完桶就撒手，没管 `minfreq_` 还对不对。它确实可能悬在一个已经不存在的桶上——但规则 7 是“先淘汰，再插入”，而插入必然把 `minfreq_` 打回 1。所以那只指针只剩半条规则的寿命，不值得为它重算一遍最小值。这不是侥幸，是规则 7 的顺序给的。
+
+<< 构造 >>= @
+	explicit Cache(std::size_t cap) : cap_(cap) {
+		if (cap == 0) throw std::invalid_argument("capacity must be >= 1");
+	}
+~@
+
+<< get >>= @
+	std::optional<V> get(const K& k) {
+		auto p = index_.find(k);
+		if (p == index_.end()) return std::nullopt; // 规则 4：计数不动
+		touch(p->second);                           // 规则 3
+		return p->second->value;                    // 搬完家，它仍指着同一个节点
+	}
+~@
+
+<< put >>= @
+	void put(const K& k, V v) {
+		auto p = index_.find(k);
+		if (p != index_.end()) {           // 规则 5
+			p->second->value = std::move(v);
+			touch(p->second);
+			return;
+		}
+		if (size_ == cap_) evict_one();    // 规则 7
+		Bucket& b = buckets_[1];           // 规则 6：新条目落在 1 档
+		b.push_front(Node{k, std::move(v), 1});
+		index_.emplace(k, b.begin());
+		minfreq_ = 1;                      // 新条目必是最低档
+		++size_;
+	}
+~@
+
+<< size >>= @
+	std::size_t size() const { return size_; }
+~@
+
+<< capacity >>= @
+	std::size_t capacity() const { return cap_; }
+~@
+
+新条目的 freq 直接写 1，跳过了一次 `touch`。这就是开头留的那个 c₀ 的答案：取 0，加一次 update，得 1。要是不让它以 0 起步、又漏掉这一下加一，新条目就是全局唯一最小，下一次淘汰必死。所以这个 1 不是随手填的，它是“插入也算一次使用”这个约定的数字形态。
+
+拼装。成员与接口的分界线还是那一条：
+
+<< LFU模型 >>= @
+	#pragma once
+
+	#include <cstddef>
+	#include <cstdint>
+	#include <iterator>
+	#include <list>
+	#include <optional>
+	#include <stdexcept>
+	#include <unordered_map>
+	#include <utility>
+
+	namespace lfu {
+
+	template <class K, class V>
+	class Cache {
+		<< 定义 >> | << 更新 >> | << 淘汰 >>
+	public:
+		<< 构造 >>
+		<< get >> | << put >> | << size >> | << capacity >>
+	};
+
+	} // namespace lfu
+~@
+
+file<hpp> lfu_bucket += << LFU模型 >>;
+~::
+
+九条外部规则一条都没破。条目数、唯一性、未命中不改计数、满时必淘汰一个——都还在。第 9 条尤其值得看一眼：除 get 与 put 外没有别的改变来源，这条在 LFU 里承重比在 LRU 里大，因为 count 只被这两个操作推着走，没有别的东西能让它变。这也意味着它**只会往上走**。
+
+## 历史包袱
+
+容量 3，`put(1)`，`get(1)` 四次，`put(2)`、`put(3)`、`put(4)`：
+
+```
+seq   1:. 2:Y 3:Y 4:Y     // LRU：淘汰 1，它最久没被用过
+lfu   1:Y 2:. 3:Y 4:Y     // LFU：淘汰 2，1 靠着五次历史活下来
+```
+
+再 `put(5)`：
+
+```
+seq   1:. 2:. 3:Y 4:Y 5:Y // LRU：接着淘汰 2
+lfu   1:Y 2:. 3:. 4:Y 5:Y // LFU：接着淘汰 3
+```
+
+两刀下去，分歧出来了。1 号早就没人碰过，LRU 第一刀就砍了它；LFU 不但留着，第二刀还看着 2 和 3 被砍。它凭什么？凭它曾经被访问过五次。
+
+这就是历史包袱，LFU 最实质的缺陷，也是它相对 LRU 唯一的硬伤。recency 只记最后一次，不用它就往下沉；count 记全部历史，不用它也不掉。一个曾经热过、如今早就冷掉的 key，会靠积累永远占着位置，新的热点进不来。缓存里那点空间被“过去的流行”占着，这叫缓存污染。
+
+后面每一个变体，修的都是这一处：
+
+- 衰减：让 count 随时间往下掉，把“曾经”改成“最近”；
+- 窗口：只看最近一段时间的计数，出窗的部分直接扔；
+- TinyLFU：换成会忘的计数器（sketch 加 reset），并把比较挪到准入那一步；
+- 2Q：根本不存计数，用队列位置当 0/1/2 的粗粒度计数。
+
+没有一个改“度量什么”。改的全是“这份历史留多久”。
+
+所以 LFU 这一节要立的不是又一个算法，是三样东西：count 的起点（=1，即插入也算一次使用）、min() 的 O(1) 结构（桶表加 `minfreq_`），以及这份历史包袱。后面每个变体，都是在补第三条。
+
+# 偏离基座
+
+前面两章各立了一个基座。LRU 的基座是 recency 序加一条链，LFU 的基座是 count 加一张桶表。两章末尾都留了同一句话：真正的问题不在“选哪个属性”，在“这套结构哪一处撑不住”。
+
+这一章把那几处排出来。它们不是几个新算法，是几次单点修改。
+
+| 名词 | 度量什么 | 在哪一步决定 | 动了基座的哪一处 |
+|---|---|---|---|
+| LRU-K | recency 的第 K 近 | 淘汰 | 记忆深度 |
+| 2Q | 队列位置（0/1/2） | 准入 | 计数换成位置 |
+| TinyLFU | frequency | 准入 | 计数换成 sketch |
+| W-TinyLFU | frequency 加 recency | 准入与淘汰 | 双轨 |
+| ARC | 自适应 | 淘汰 | 混合比变参数 |
+
+横着看是“改了什么”，竖着看是“在哪一步改”。五节按这个次序排，因为每一节都借上一节的东西：LRU-K 借 LRU 的链，2Q 借 LRU 的两条链，TinyLFU 借 LFU 的计数，W-TinyLFU 借前两者，ARC 借全部。
+
+每节还是那套规矩：实现、对着九条规则看改了什么、同一串操作喂下去看谁出局。
+
+## 记忆深度：LRU-K
+
+LRU 记最后一次。这个“一次”是可以调的：记第 K 近的那次，写成 t_K(k)，淘汰 t_K 最大的那批。
+
+K = 1 就退化成 LRU。K 变大，效果是“一次访问不算数”——要让一个条目有分量，得在它身上留下 K 次痕迹。O'Neil 一九九三年提出它，动机正是扫描：一次顺序全表扫，每条都只碰一次，LRU 会被洗一遍；LRU-K 里这些条目都还没攒够 K 次，天然站在最危险的位置，洗不动真正的热数据。
+
+所以 LRU-K 的序不是一个量，是两个级别：
+
+!! lruk::
+<< 定义 >>= @
+	struct Entry {
+		V value;
+		std::deque<std::uint64_t> hist; // 最近 K 次访问的时刻，新在尾
+	};
+
+	std::size_t cap_;
+	std::size_t k_;
+	std::uint64_t tick_ = 0;
+	std::unordered_map<K, Entry> table_;
+
+	// 排序键：(是否攒够 K 次, 窗口里最早的那次)
+	std::pair<int, std::uint64_t> rank(const Entry& e) const {
+		return {e.hist.size() < k_ ? 0 : 1, e.hist.front()};
+	}
+~@
+
+`rank` 的第一位就是那个级别。0 表示历史不足，1 表示攒够了。任何历史不足的条目都排在攒够的条目之前——这是 LRU-K 和 LRU 最实质的差别：LRU 里所有条目在同一级别上比新旧，LRU-K 先把它们分成两级，同级再比时刻。
+
+第二位用 `hist.front()`，也就是窗口里最早的那次。攒够 K 次时它就是第 K 近；不足 K 次时它是第一次访问，用来给同一级别里的条目定先后。少了这一位，一堆 rank 为 0 的条目就没法比，淘汰谁取决于表序——这就是开头说的“要全序不能只有偏序”。
+
+<< 更新 >>= @
+	void update(Entry& e) {
+		e.hist.push_back(++tick_);
+		if (e.hist.size() > k_) e.hist.pop_front(); // 窗口滑动：只留最近 K 次
+	}
+~@
+
+`hist` 是个定长滑动窗。挤进去一次，超过 K 就弹掉最旧的一次，所以 update 是 O(1)，空间是每个条目 K 个时间戳。K 越大，记忆越长，空间和“不信任新条目”的程度一起涨。
+
+<< 淘汰 >>= @
+	void evict_min() {
+		auto victim = table_.begin();
+		for (auto it = table_.begin(); it != table_.end(); ++it)
+			if (rank(it->second) < rank(victim->second)) victim = it;
+		table_.erase(victim);
+	}
+~@
+
+这里故意不优化：min() 扫全表，O(n)。LRU-K 把 O(1) 的 min() 弄丢了，这是它的代价。真实实现靠堆或跳表把 rank 最小的维护起来，摊到 O(log n)，细节不影响这一节要看的东西。前面说过，桶和 `minfreq_` 是 LFU 存在的理由；LRU-K 没有那个结构，它只有 K 个时间戳和一次扫描。
+
+<< 构造 >>= @
+	Cache(std::size_t cap, std::size_t k) : cap_(cap), k_(k) {
+		if (cap == 0 || k == 0) throw std::invalid_argument("cap and K must be >= 1");
+	}
+~@
+
+<< get >>= @
+	std::optional<V> get(const K& k) {
+		auto p = table_.find(k);
+		if (p == table_.end()) return std::nullopt; // 规则 4：窗口不动
+		update(p->second);                          // 规则 3
+		return p->second.value;
+	}
+~@
+
+<< put >>= @
+	void put(const K& k, V v) {
+		auto p = table_.find(k);
+		if (p != table_.end()) {            // 规则 5
+			p->second.value = std::move(v);
+			update(p->second);
+			return;
+		}
+		if (table_.size() == cap_) evict_min(); // 规则 7
+		Entry e;
+		e.value = std::move(v);
+		update(e);                          // 规则 6：插入也算一次访问
+		table_.emplace(k, std::move(e));
+	}
+~@
+
+<< size >>= @
+	std::size_t size() const { return table_.size(); }
+~@
+
+<< capacity >>= @
+	std::size_t capacity() const { return cap_; }
+~@
+
+拼装：
+
+``
+<< LRUK模型 >>= @
+	#pragma once
+
+	#include <cstddef>
+	#include <cstdint>
+	#include <deque>
+	#include <optional>
+	#include <stdexcept>
+	#include <unordered_map>
+	#include <utility>
+
+	namespace lrk {
+
+	template <class K, class V>
+	class Cache {
+		<< 定义 >> | << 更新 >> | << 淘汰 >>
+	public:
+		<< 构造 >>
+		<< get >> | << put >> | << size >> | << capacity >>
+	};
+
+	} // namespace lrk
+~@
+
+file<hpp> lru_k += << LRUK模型 >>;
+~::
+
+改动只有一处：规则 3、5 里的 update，从“覆盖一个时刻”变成“往窗口里挤一个时刻”。规则 7 的 min() 还是取最小，只是比较的不再是单一时刻，是 `rank` 这个二元组。九条外部规则全在。
+
+把扫描喂进去看。容量 3，K = 2，前三条各访问两次（攒够 K），然后 `put(4)`、`put(5)`：
+
+```
+seq   1:. 2:. 3:Y 4:Y 5:Y // LRU：两刀砍掉 1 和 2
+lr2k  1:. 2:Y 3:Y 4:. 5:Y // LRU-K：4 历史不足，第二刀就出局
+```
+
+4 号只被访问过一次——`put` 那次。它的 rank 是 (0, t)，2、3 的 rank 是 (1, t')，0 < 1，所以第二刀必然砍 4。扫描流进不来，这正是 LRU-K 要的效果。
+
+代价也在这儿：任何新条目都得先攒够 K 次才能上桌，冷启动和突发访问都变迟钝。K 是个旋钮，往小拧像 LRU，往大拧就越来越只认“反复出现”。它不是换成 frequency，是把 recency 的记忆从一次拉到 K 次。
+
+## 决定时机：2Q
+
+前面每一节改的都是“淘汰谁”。2Q 改的是另一件事：谁有资格进来。
+
+它由三个队列组成。A1 是 FIFO，新条目先进这里；Am 是 LRU，被第二次访问的条目从 A1 升上来；A1out 是影子队列，只存 key 不存值，记录“最近从 A1 出去过”的那些。
+
+于是“这个 key 被访问过几次”这件事，不用计数器也记得住，靠位置记：
+
+| 位置 | 含义 | 粗糙的计数 |
+|---|---|---|
+| 不在任何队列 | 没见过 | 无 |
+| A1out | 来过，已经走了 | 0 |
+| A1 | 来过一次，还在候车 | 1 |
+| Am | 来过至少两次 | 2 |
+
+这就是“计数换成位置”。代价是粒度：只知道 0、1、2，再多的次数分不出来。收益是空间：A1out 存 key 不存 value，比给每条挂一个 64 位计数器便宜得多，淘汰它的代价也几乎为零。
+
+A1 用 FIFO 而不是 LRU，同样是这个道理：A1 里的条目都只被碰过一次，没有新旧之分，FIFO 更便宜，而且它本来只是个候车室。
+
+!! twoq::
+<< 定义 >>= @
+	using A1    = std::list<std::pair<K, V>>; // 候车：FIFO
+	using A1It  = typename A1::iterator;
+	using Am    = std::list<K>;               // 热区：LRU
+	using AmIt  = typename Am::iterator;
+	using Out   = std::list<K>;               // 影子：只有 key
+	using OutIt = typename Out::iterator;
+
+	std::size_t cap_, ki_, kout_;
+	A1 a1_;
+	std::unordered_map<K, A1It> a1p_;
+	Am am_;
+	std::unordered_map<K, AmIt> amp_;
+	std::unordered_map<K, V> amv_;
+	Out out_;
+	std::unordered_map<K, OutIt> outp_;
+~@
+
+A1 里存 `pair<K,V>`，因为它可能带着值被访问；Am 和 out_ 只存 key，值在 `amv_` 里。三张 `key -> 迭代器` 的表各管一段，和前面几节的 `index_` 是同一类保证：list 节点不搬家，迭代器一直有效。
+
+<< 更新 >>= @
+	void trim_a1() {
+		while (a1_.size() > ki_) {
+			K k = std::move(a1_.front().first);
+			a1p_.erase(k);
+			a1_.pop_front();
+			out_.push_back(k);              // 出去的不销毁，进影子
+			outp_[k] = std::prev(out_.end());
+			while (out_.size() > kout_) {   // 影子也有界
+				outp_.erase(out_.front());
+				out_.pop_front();
+			}
+		}
+	}
+
+	void trim_am() {
+		while (am_.size() + ki_ > cap_) {   // Am 的配额是 cap - Ki
+			K k = std::move(am_.back());
+			amp_.erase(k);
+			amv_.erase(k);
+			am_.pop_back();
+		}
+	}
+
+	void enter_am(const K& k, V v) {
+		amv_[k] = std::move(v);
+		am_.push_front(k);
+		amp_[k] = am_.begin();
+		trim_am();
+	}
+
+	void touch_am(const K& k) { am_.splice(am_.begin(), am_, amp_.at(k)); }
+~@
+
+`trim_a1` 是三件事的合流：A1 超配额、队头出队、出队的 key 进影子。注意它不删值——A1 的队头本来就是被挤出去的，值跟着 `pair` 一起销毁，影子只留 key。这一条是 2Q 空间省的来源。
+
+<< get >>= @
+	std::optional<V> get(const K& k) {
+		if (amp_.count(k)) { touch_am(k); return amv_.at(k); } // 规则 3：热区，挪头
+		auto p = a1p_.find(k);
+		if (p == a1p_.end()) return std::nullopt;              // 规则 4
+		V v = p->second->second;                               // 规则 3：二次访问
+		a1_.erase(p->second);
+		a1p_.erase(p);
+		enter_am(k, v);                                        // 升到 Am
+		return v;
+	}
+~@
+
+<< put >>= @
+	void put(const K& k, V v) {
+		auto pa = amp_.find(k);
+		if (pa != amp_.end()) {            // 规则 5：已在热区
+			amv_[k] = std::move(v);
+			touch_am(k);
+			return;
+		}
+		auto p1 = a1p_.find(k);
+		if (p1 != a1p_.end()) {            // 规则 6：同一 key 第二次写，升档
+			a1_.erase(p1->second);
+			a1p_.erase(p1);
+			enter_am(k, std::move(v));
+			return;
+		}
+		auto po = outp_.find(k);
+		if (po != outp_.end()) {           // 准入：影子命中，直接进热区
+			out_.erase(po->second);
+			outp_.erase(po);
+			enter_am(k, std::move(v));
+			return;
+		}
+		a1_.push_back({k, std::move(v)});  // 全新：进候车室
+		a1p_[k] = std::prev(a1_.end());
+		trim_a1();
+	}
+~@
+
+<< size >>= @
+	std::size_t size() const { return am_.size() + a1_.size(); }
+~@
+
+<< capacity >>= @
+	std::size_t capacity() const { return cap_; }
+~@
+
+拼装：
+
+<< 2Q模型 >>= @
+	#pragma once
+
+	#include <cstddef>
+	#include <list>
+	#include <optional>
+	#include <unordered_map>
+	#include <utility>
+
+	namespace tq {
+
+	template <class K, class V>
+	class Cache {
+		<< 定义 >> | << 更新 >>
+	public:
+		Cache(std::size_t cap, std::size_t ki, std::size_t kout)
+		    : cap_(cap), ki_(ki), kout_(kout) {}
+		<< get >> | << put >> | << size >> | << capacity >>
+	};
+
+	} // namespace tq
+~@
+
+file<hpp> lru_tq += << 2Q模型 >>;
+~::
+
+改动落在三条规则上。规则 3：`get` 命中 A1 不再只是记一笔，是把条目从 A1 搬到 Am——update 的语义从“挪位置”变成“换队列”。规则 6：`put` 新 key 不直接进缓存，先进 A1 候车。规则 7：淘汰优先砍 A1 的队头，A1 空了才动 Am 的尾部。
+
+第 6 条改了什么？新条目进来时缓存早满了，但它进的是 A1，不是主结构。所以 2Q 的容量分成两段配额，`ki_` 给 A1，`cap_ - ki_` 给 Am。`ki_` 越小，越不信任新条目。
+
+容量 4，A1 配额 2。`put(1)`、`get(1)`（升到 Am），然后 `put(2)`、`put(3)`、`put(4)`、`put(5)`：
+
+```
+seq   1:. 2:Y 3:Y 4:Y 5:Y // LRU：1 被四连击洗掉
+tq    1:Y 2:. 3:. 4:Y 5:Y // 2Q：1 守在 Am，挨洗的只有 A1
+```
+
+LRU 里 1 号虽然刚被 `get` 过，随后四次 `put` 还是把它一路推到队尾，第五次就被砍了。2Q 里 2、3、4 全在 A1 排队，A1 只有两个位置，先进的两个被挤进影子，一个都没碰到 Am 里的 1。
+
+强项是抗扫描，弱项也在这儿：`ki_` 设得小，突发流量会在 A1 里互相淘汰，看起来像“什么都没缓存”。但它没有 LFU 的历史包袱——它压根不记历史，只记到 2 为止，而 Am 内部是 LRU，冷掉的东西照样会沉底。
+
+## 计数存储：TinyLFU
+
+LFU 那一节留了一个问题没答：频率怎么在有限空间里存。
+
+要给每个 key 挂一个 64 位计数，空间就和 key 的数量成正比——缓存本身已经有界了，可计数表还得给每个“曾经出现过的 key”留位置，包括早就被淘汰的。这是 LFU 的内存债。
+
+TinyLFU 的答案是 **Count-Min Sketch**：一张 D 行 W 列的二维表，每格一个 4 位计数器。一个 key 不占固定的一格，而是哈希到每行一个位置，D 个位置一起记。查的时候取这 D 个值里最小的那个。
+
+取最小是有道理的。哈希会碰撞，碰撞只会让计数变大，不会变小——别处来的访问蹭到了这一格。所以 D 个估计值里，每一个都是真实值的上界，取最小就是最紧的那个上界。这是概率数据结构的老套路：用可控的高估换固定空间。
+
+空间是 `D × W × 4` 位，和 key 有多少个无关。代价是误差，误差由 W 和 D 决定，和缓存容量无关。
+
+4 位有个硬上限：15。撞得多了，格子饱和，所有 key 的估计值都变成 15，频率就失去分辨力。所以必须老化：
+
+!! tinylfu::
+<< 定义 >>= @
+	static constexpr std::size_t W = 64;   // 每行格数
+	static constexpr std::size_t D = 4;    // 行数，即哈希函数个数
+	static constexpr std::size_t AGE = 8;  // 每多少次访问做一次全局减半
+
+	std::array<std::array<std::uint8_t, W>, D> c_{}; // 4 位计数，这里用 uint8 存
+	std::size_t cap_;
+	std::size_t ops_ = 0;
+	std::list<std::pair<K, V>> order_;               // 主结构：LRU
+	std::unordered_map<K, typename std::list<std::pair<K, V>>::iterator> pos_;
+	std::hash<K> h_;
+~@
+
+<< 哈希 >>= @
+	std::uint64_t hs(const K& k) const {
+		std::uint64_t x = static_cast<std::uint64_t>(h_(k));
+		x += 0x9e3779b97f4a7c15ull;                  // splitmix64：把弱哈希搅开
+		x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+		x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+		return x ^ (x >> 31);
+	}
+
+	std::size_t ix(std::uint64_t h, std::size_t i) const { return (h >> (i * 13)) % W; }
+~@
+
+这里必须搅一下。`std::hash<int>` 对整数是恒等映射，小整数右移十三位全是零，四行会全撞在同一格——sketch 立刻退化成“所有 key 一个计数”。splitmix64 把低位的信息摊到高位，四行才真的落在四个不同位置。
+
+<< 计数 >>= @
+	void bump(std::uint64_t h) {
+		for (std::size_t i = 0; i < D; ++i) {
+			auto& v = c_[i][ix(h, i)];
+			if (v < 15) ++v;                 // 4 位饱和
+		}
+	}
+
+	int est(std::uint64_t h) const {
+		int m = 15;
+		for (std::size_t i = 0; i < D; ++i) m = std::min<int>(m, c_[i][ix(h, i)]);
+		return m;
+	}
+
+	void tick() {
+		if (++ops_ % AGE) return;
+		for (auto& row : c_)
+			for (auto& v : row) v = static_cast<std::uint8_t>(v >> 1); // 全体减半
+	}
+~@
+
+`tick` 是遗忘机制，也是这本书里第一次有“时间自己让状态变”的东西——LFU 的 count 只增不减，这里每 AGE 次访问全体右移一位，等于所有频率一起打折。老的历史追不上新的访问，包袱就被甩掉了。
+
+真实的 TinyLFU 用 W-TinyLFU 里的墓碑机制做老化（每十万次访问重置一次），这里用固定间隔减半，机制一样，数字不同。
+
+<< get >>= @
+	std::optional<V> get(const K& k) {
+		tick();
+		bump(hs(k));                       // 未命中也记一笔
+		auto p = pos_.find(k);
+		if (p == pos_.end()) return std::nullopt; // 规则 4 变了：结构不动，计数动
+		order_.splice(order_.begin(), order_, p->second);
+		return p->second->second;
+	}
+~@
+
+注意 `bump` 在 `find` 之前。未命中也计数，这是 TinyLFU 的关键：它要记住“这个 key 出现过”，即使这次没进来，下次它带着更高的频率再来。
+
+<< put >>= @
+	void put(const K& k, V v) {
+		tick();
+		bump(hs(k));
+		auto p = pos_.find(k);
+		if (p != pos_.end()) {             // 规则 5
+			p->second->second = std::move(v);
+			order_.splice(order_.begin(), order_, p->second);
+			return;
+		}
+		if (order_.size() == cap_) {       // 规则 7 变成“比较”
+			const K victim = order_.back().first;
+			if (est(hs(k)) <= est(hs(victim))) return; // 准入被拒：什么都不做
+			pos_.erase(victim);
+			order_.pop_back();
+		}
+		order_.push_front({k, std::move(v)}); // 规则 6
+		pos_[k] = order_.begin();
+	}
+~@
+
+`put` 里那个 `return` 是全书第一次出现“写操作可以什么都不做”。前面所有模型的 `put` 保证条目进去，这里它可以拒绝——因为它先做了一次比较：新条目的频率打不打得过受害者。
+
+这就是“准入”和“淘汰”的区别。淘汰是“满了我得砍一个”，准入是“你俩比一比，输的走”。LRU 永远让新的进来、让最旧的走；TinyLFU 让强的留下，不管谁更新。
+
+<< 拼装 >>= @
+	#pragma once
+
+	#include <algorithm>
+	#include <array>
+	#include <cstddef>
+	#include <cstdint>
+	#include <list>
+	#include <optional>
+	#include <unordered_map>
+	#include <utility>
+
+	namespace tlf {
+
+	template <class K, class V>
+	class Cache {
+		<< 定义 >> | << 哈希 >> | << 计数 >>
+	public:
+		explicit Cache(std::size_t cap) : cap_(cap) {}
+		<< get >> | << put >>
+		std::size_t size() const { return order_.size(); }
+		std::size_t capacity() const { return cap_; }
+	};
+
+	} // namespace tlf
+~@
+
+file<hpp> lru_tinylfu += << 拼装 >>;
+~::
+
+规则对照：规则 6 不再是“插入”，而是“可能插入”；规则 7 的 min() 不再单独使用，它被拿去和新条目比较。规则 4 也被松了一点：`get` 未命中不动结构，但计数变了——所以“不留痕”这条在 TinyLFU 里只剩一半。
+
+容量 3，`put(1)`、`get(1)` 三次（频率 4），`put(2)`、`put(3)`（频率各 1），再 `put(4)`：
+
+```
+seq   1:. 2:Y 3:Y 4:Y // LRU：淘汰 2，4 进来
+tlf   1:Y 2:Y 3:Y 4:. // TinyLFU：4 的频率 1 打不过 1，被拒在门外
+```
+
+4 号输在“1 不大于 1”。要是改成 `>=`，它就能挤掉 2——但那等于说“一样强的新人优先”，扫描流会借着这个口子灌进来。所以必须是严格大于。
+
+代价也很明显：一次性的热点永远进不来，哪怕它马上要被访问一百次。sketch 只记过去，不预测未来。
+
+## 双轨：W-TinyLFU
+
+TinyLFU 有一个要命的前提：新条目要和老条目比频率，可它刚出现，频率必然是 1。碰上缓存里随便一个频率 2 的条目，它就输了。于是新东西永远进不来——这叫冷启动饥饿。
+
+W-TinyLFU 的办法是给新条目一条专用通道：一个很小的 **window LRU**（真实配置约 1% 容量）。新条目先无条件进窗口，在窗口里待着、被访问、把频率攒起来。窗口溢出时，挤出来的那个才有资格去和 main 区比。
+
+所以它是两条轨：
+
+- 窗口：纯 LRU，不看频率，负责吸收突发；
+- main：SLRU（segmented LRU），分试用区 probation 和保护区 protected，负责长期驻留。
+
+`get` 命中 probation 的条目，把它升到 protected——这是 main 内部的第二次筛选。
+
+!! wtinylfu::
+<< 定义 >>= @
+	using List = std::list<std::pair<K, V>>;
+	using Iter = typename List::iterator;
+
+	std::size_t cap_, win_cap_, pcap_, qcap_;
+	std::size_t ops_ = 0;
+	std::array<std::array<std::uint8_t, 64>, 4> c_{}; // 和 TinyLFU 同一张 sketch
+	List win_, prob_, prot_;
+	std::unordered_map<K, Iter> wp_, pp_, rp_;
+	std::hash<K> h_;
+~@
+
+哈希与计数和上一节逐字相同，这里直接沿用同一个实现：
+
+<< 哈希 >>= @
+	std::uint64_t hs(const K& k) const {
+		std::uint64_t x = static_cast<std::uint64_t>(h_(k));
+		x += 0x9e3779b97f4a7c15ull;
+		x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+		x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+		return x ^ (x >> 31);
+	}
+
+	std::size_t ix(std::uint64_t h, std::size_t i) const { return (h >> (i * 13)) % 64; }
+
+	void bump(std::uint64_t h) {
+		for (std::size_t i = 0; i < 4; ++i) {
+			auto& v = c_[i][ix(h, i)];
+			if (v < 15) ++v;
+		}
+	}
+
+	int est(std::uint64_t h) const {
+		int m = 15;
+		for (std::size_t i = 0; i < 4; ++i) m = std::min<int>(m, c_[i][ix(h, i)]);
+		return m;
+	}
+
+	void tick() {
+		if (++ops_ % 8) return;
+		for (auto& row : c_)
+			for (auto& v : row) v = static_cast<std::uint8_t>(v >> 1);
+	}
+~@
+
+准入只有一个入口：窗口溢出。
+
+<< 更新 >>= @
+	void admit(std::pair<K, V> cand) {
+		if (prob_.size() < pcap_) {          // 试用区没满，直接进
+			prob_.push_front(std::move(cand));
+			pp_[prob_.front().first] = prob_.begin();
+			return;
+		}
+		const K vic = prob_.back().first;    // 满则比较：候选 vs 试用区尾部
+		if (est(hs(cand.first)) <= est(hs(vic))) return; // 打不过就丢
+		pp_.erase(vic);
+		prob_.pop_back();
+		prob_.push_front(std::move(cand));
+		pp_[prob_.front().first] = prob_.begin();
+	}
+
+	void demote() {
+		while (prot_.size() > qcap_) {       // 保护区超编，降回试用区
+			auto cand = std::move(prot_.back());
+			prot_.pop_back();
+			rp_.erase(cand.first);
+			prob_.push_front(std::move(cand));
+			pp_[prob_.front().first] = prob_.begin();
+		}
+	}
+~@
+
+`demote` 是 SLRU 的名字来源：保护区不是只进不出，超编的要退回试用区重新排队。这样 protected 里留的是“最近还在被访问”的那批，而不是“曾经很热”的那批。
+
+<< get >>= @
+	std::optional<V> get(const K& k) {
+		tick();
+		bump(hs(k));
+		if (auto p = wp_.find(k); p != wp_.end()) {   // 窗口：纯 LRU
+			win_.splice(win_.begin(), win_, p->second);
+			return p->second->second;
+		}
+		if (auto p = pp_.find(k); p != pp_.end()) {   // 试用区命中 → 升保护
+			V v = p->second->second;
+			prob_.erase(p->second);
+			pp_.erase(p);
+			prot_.push_front({k, v});
+			rp_[k] = prot_.begin();
+			demote();
+			return v;
+		}
+		if (auto p = rp_.find(k); p != rp_.end()) {   // 保护区：挪头
+			prot_.splice(prot_.begin(), prot_, p->second);
+			return p->second->second;
+		}
+		return std::nullopt;
+	}
+~@
+
+<< put >>= @
+	void put(const K& k, V v) {
+		tick();
+		bump(hs(k));
+		if (auto p = wp_.find(k); p != wp_.end()) {
+			p->second->second = std::move(v);
+			win_.splice(win_.begin(), win_, p->second);
+			return;
+		}
+		if (auto p = pp_.find(k); p != pp_.end()) { p->second->second = std::move(v); return; }
+		if (auto p = rp_.find(k); p != rp_.end()) {
+			p->second->second = std::move(v);
+			prot_.splice(prot_.begin(), prot_, p->second);
+			return;
+		}
+		win_.push_front({k, std::move(v)});           // 规则 6 第一段：无条件进窗口
+		wp_[k] = win_.begin();
+		while (win_.size() > win_cap_) {              // 窗口溢出才走准入
+			auto cand = std::move(win_.back());
+			win_.pop_back();
+			wp_.erase(cand.first);
+			admit(std::move(cand));
+		}
+	}
+~@
+
+拼装：
+
+<< 拼装 >>= @
+	#pragma once
+
+	#include <algorithm>
+	#include <array>
+	#include <cstddef>
+	#include <cstdint>
+	#include <list>
+	#include <optional>
+	#include <unordered_map>
+	#include <utility>
+
+	namespace wtl {
+
+	template <class K, class V>
+	class Cache {
+		<< 定义 >> | << 哈希 >> | << 更新 >>
+	public:
+		Cache(std::size_t cap, std::size_t win, std::size_t pcap)
+		    : cap_(cap), win_cap_(win), pcap_(pcap),
+		      qcap_(cap > win + pcap ? cap - win - pcap : 0) {}
+		<< get >> | << put >>
+		std::size_t size() const { return win_.size() + prob_.size() + prot_.size(); }
+		std::size_t capacity() const { return cap_; }
+	};
+
+	} // namespace wtl
+~@
+
+file<hpp> lru_wtinylfu += << 拼装 >>;
+~::
+
+规则 6 现在分两段：先无条件进窗口，再从窗口挤出来时才有条件地进 main。规则 7 也从一次判定变成两处淘汰——窗口自己挤，main 靠准入。
+
+容量 4，窗口 1 格，试用区 1 格。`put(1)`、`get(1)` 三次（频率 4），然后 `put(2)`、`put(3)`、`put(4)`：
+
+```
+seq   1:. 2:Y 3:Y 4:Y // LRU：淘汰 1
+wtl   1:Y 2:. 3:. 4:Y // W-TinyLFU：2、3 各被窗口放行一次，都被 1 挡住
+```
+
+注意 `size` 只有 2，缓存没被填满。这不是 bug：三个条目都从窗口出来，都撞上频率 4 的 1，全被拒。窗口的容量决定了“同时能有多少个新人排队”，窗口越小，准入越严。
+
+窗口 1 格是为了让例子两步就出结果。真实配置是主容量的 1%，main 再按 2:8 分试用区和保护区。这三个比例是 W-TinyLFU 唯一的调参项，其余全是定死的机制——这正是它比 ARC 好部署的地方。
+
+## 混合比：ARC
+
+前面几个方案都在回答“recency 和 frequency 各占多少”。2Q 用 `ki_` 回答，W-TinyLFU 用窗口和试用区的大小回答，都是**事先定死的数**。
+
+问题是这个数取决于负载。扫描型负载要 recency，反复访问型负载要 frequency，同一个进程在不同时段可能两种都有。定死的比例总有一半时间是错的。
+
+ARC 把这个问题交给运行时的自己：不预设比例，让“淘汰错了的后悔”来调。
+
+它维护四个队列。T1 放只被访问过一次的条目，T2 放至少两次的。B1 和 B2 是影子，只存 key：
+
+| 队列 | 内容 | 在内存里 |
+|---|---|---|
+| T1 | 一次访问 | 值在 |
+| T2 | 两次以上 | 值在 |
+| B1 | 从 T1 淘汰的 | 只有 key |
+| B2 | 从 T2 淘汰的 | 只有 key |
+
+参数 `p` 是 T1 的目标大小。淘汰时看 `|T1|` 和 `p` 的关系：`|T1|` 超了就从 T1 尾砍，否则从 T2 尾砍。
+
+自适应发生在影子命中：一个 key 从 B1 被再次访问，说明“当初把它从 T1 淘汰是错的”，于是 `p` 加一，T1 下次多留一会儿。从 B2 命中则反过来，`p` 减一。
+
+!! arc::
+<< 定义 >>= @
+	using List = std::list<K>;
+	using Iter = typename List::iterator;
+
+	std::size_t cap_;
+	std::size_t p_ = 0;                  // T1 的目标大小，唯一的动态参数
+	std::unordered_map<K, V> val_;
+	List t1_, t2_, b1_, b2_;
+	std::unordered_map<K, Iter> t1p_, t2p_, b1p_, b2p_;
+~@
+
+<< 更新 >>= @
+	bool full() const { return t1_.size() + t2_.size() >= cap_; }
+
+	void replace(bool in_b2) {
+		if (!t1_.empty() && (t1_.size() > p_ || (in_b2 && t1_.size() == p_))) {
+			K k = t1_.back();            // 从 T1 尾砍：它是一次访问的
+			t1_.pop_back();
+			t1p_.erase(k);
+			val_.erase(k);
+			b1_.push_front(k);           // 只留 key 进影子
+			b1p_[k] = b1_.begin();
+		} else if (!t2_.empty()) {
+			K k = t2_.back();            // 从 T2 尾砍：它是多次访问的
+			t2_.pop_back();
+			t2p_.erase(k);
+			val_.erase(k);
+			b2_.push_front(k);
+			b2p_[k] = b2_.begin();
+		}
+	}
+
+	void push_t2(const K& k, V v) {
+		val_[k] = std::move(v);
+		t2_.push_front(k);
+		t2p_[k] = t2_.begin();
+	}
+~@
+
+`replace` 里的 `in_b2` 那个条件就是自适应的落点：从 B2 回来时，即使 `|T1|` 正好等于 `p`，也优先砍 T1——因为 B2 命中意味着 frequency 那边更值得保护。
+
+<< get >>= @
+	std::optional<V> get(const K& k) {
+		if (auto p = t1p_.find(k); p != t1p_.end()) {  // T1 命中 → 升 T2
+			V v = val_.at(k);
+			t1_.erase(p->second);
+			t1p_.erase(p);
+			push_t2(k, v);
+			return v;
+		}
+		if (auto p = t2p_.find(k); p != t2p_.end()) {
+			t2_.splice(t2_.begin(), t2_, p->second);
+			return val_.at(k);
+		}
+		return std::nullopt;                            // 影子命中不在这里
+	}
+~@
+
+<< put >>= @
+	void put(const K& k, V v) {
+		if (auto p = t1p_.find(k); p != t1p_.end()) {
+			t1_.erase(p->second);
+			t1p_.erase(p);
+			push_t2(k, std::move(v));
+			return;
+		}
+		if (auto p = t2p_.find(k); p != t2p_.end()) {
+			val_[k] = std::move(v);
+			t2_.splice(t2_.begin(), t2_, p->second);
+			return;
+		}
+		if (b1p_.count(k)) {                 // B1 命中：T1 该更大
+			if (p_ < cap_) ++p_;
+			b1_.erase(b1p_.at(k));
+			b1p_.erase(k);
+			while (full()) replace(false);
+			push_t2(k, std::move(v));
+			return;
+		}
+		if (b2p_.count(k)) {                 // B2 命中：T2 该更大
+			if (p_ > 0) --p_;
+			b2_.erase(b2p_.at(k));
+			b2p_.erase(k);
+			while (full()) replace(true);
+			push_t2(k, std::move(v));
+			return;
+		}
+		while (full()) replace(false);       // 全新条目
+		val_[k] = std::move(v);
+		t1_.push_front(k);
+		t1p_[k] = t1_.begin();
+	}
+~@
+
+拼装：
+
+<< 拼装 >>= @
+	#pragma once
+
+	#include <cstddef>
+	#include <list>
+	#include <optional>
+	#include <unordered_map>
+	#include <utility>
+
+	namespace arc {
+
+	template <class K, class V>
+	class Cache {
+		<< 定义 >> | << 更新 >>
+	public:
+		explicit Cache(std::size_t cap) : cap_(cap) {}
+		<< get >> | << put >>
+		std::size_t size() const { return t1_.size() + t2_.size(); }
+		std::size_t capacity() const { return cap_; }
+	};
+
+	} // namespace arc
+~@
+
+file<hpp> lru_arc += << 拼装 >>;
+~::
+
+九条规则里改的是第 7 条，而且改得最狠：`min()` 不再是一个固定序上的取最小，它变成 `replace`，依据是 `p` 和 `|T1|` 的关系，而 `p` 自己会被下一次访问改。序在这里不是常量，是一个状态变量——这是全书唯一一个把“序”本身做成活的模型。
+
+容量 4。先让 1 到 4 各被访问三次（`put` 一次、`get` 两次），四条都进 T2。然后扫 5 到 8：
+
+```
+seq   1:. 2:. 3:. 4:. 5:Y 6:Y 7:Y 8:Y // LRU：热数据被扫描洗光
+arc   1:. 2:Y 3:Y 4:Y 5:. 6:. 7:. 8:Y // ARC：扫描只在 T1 里互相淘汰
+```
+
+LRU 四刀下去，1 到 4 全被扫出去，缓存里只剩最后四个扫描到的。ARC 里 5、6、7 依次出局，因为都只被访问过一次；2、3、4 蹲在 T2，一个都没被碰到。
+
+切法值得看一眼。第一次 `put(5)` 时 T1 是空的，`|T1| = 0` 不大于 `p = 0`，只能砍 T2 的尾，也就是 1。从第二个扫描条目起 `|T1| > p` 成立，砍的换成 T1 的尾——上一个扫描条目。于是 5、6、7 只在 T1 里自己消耗自己。
+
+这个例子里 `p` 一直是 0，自适应没被触发。它要在“被淘汰的条目事后又被访问”时才显形：`get(1)` 把 1 抬进 T2，`put(5)` 砍掉 2 进 B1，再 `put(2)` 时 B1 命中，`p` 从 0 变成 1，`replace` 的落点随即从 T2 换到 T1。整个过程没有任何外部配置——`p` 是被“淘汰之后又要回来”这件事推着走的。
+
+代价是四个队列、两张影子表，内存最多是缓存的两倍。而且 `p` 的调整是渐进的，负载突变时要过一阵才找到新平衡。它换来的东西前面几个都给不了：不需要知道负载是什么样。
+
+---
+
+dir top @
+	file<hpp> lru_sequence;
+	file<hpp> lru_timestamp;
+	file<hpp> lru_clock;
+	file<hpp> lru_redis;
+	file<hpp> lfu_bucket;
+	file<hpp> lru_k;
+	file<hpp> lru_tq;
+	file<hpp> lru_tinylfu;
+	file<hpp> lru_wtinylfu;
+	file<hpp> lru_arc;
+~@
+
+---
+
+book lru @
+	name 对 LRU 的深挖，以及缓存淘汰与准入策略;
+	part body;
+~@
+
+part body @
+	name 正文;
+	essay book/lru.nw;
+~@
+
+
+
+
+
+

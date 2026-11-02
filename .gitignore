@@ -1,0 +1,14 @@
+# Python 虚拟环境
+**/.venv/
+__pycache__/
+*.pyc
+
+# 参考材料：第三方原始素材，体积大且可重新下载
+language/cpp/reference/
+
+# 工具 jar：按各项目 README 自行下载
+**/tools/*.jar
+
+# 系统杂项
+.DS_Store
+Thumbs.db
